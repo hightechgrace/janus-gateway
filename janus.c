@@ -25,6 +25,9 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <poll.h>
+#ifdef HAVE_TURNRESTAPI
+#include <curl/curl.h>
+#endif
 
 #include "janus.h"
 #include "version.h"
@@ -225,10 +228,20 @@ static gboolean accept_new_sessions = TRUE;
  * to avoid leaks or orphaned media details. This means that, if for instance
  * you're trying to set up a call with someone, and that someone only answers
  * a minute later, the candidates you sent initially will be discarded and
- * the call will fail. You can modify the default value in janus.cfg */
+ * the call will fail. You can modify the default value in janus.jcfg */
 #define DEFAULT_CANDIDATES_TIMEOUT		45
 static uint candidates_timeout = DEFAULT_CANDIDATES_TIMEOUT;
 
+/* By default we list dependencies details, but some may prefer not to */
+static gboolean hide_dependencies = FALSE;
+
+/* WebRTC encryption is obviously enabled by default. In the rare cases
+ * you want to disable it for debugging purposes, though, you can do
+ * that either via command line (-w) or in the main configuration file */
+static gboolean webrtc_encryption = TRUE;
+gboolean janus_is_webrtc_encryption_enabled(void) {
+	return webrtc_encryption;
+}
 
 /* Information */
 static json_t *janus_info(const char *transaction) {
@@ -278,6 +291,25 @@ static json_t *janus_info(const char *transaction) {
 	json_object_set_new(info, "auth_token", janus_auth_is_enabled() ? json_true() : json_false());
 	json_object_set_new(info, "event_handlers", janus_events_is_enabled() ? json_true() : json_false());
 	json_object_set_new(info, "opaqueid_in_api", janus_is_opaqueid_in_api_enabled() ? json_true() : json_false());
+	if(!webrtc_encryption)
+		json_object_set_new(info, "webrtc_encryption", json_false());
+	/* Dependencies */
+	if(!hide_dependencies) {
+		json_t *deps = json_object();
+		char glib2_version[20];
+		g_snprintf(glib2_version, sizeof(glib2_version), "%d.%d.%d", glib_major_version, glib_minor_version, glib_micro_version);
+		json_object_set_new(deps, "glib2", json_string(glib2_version));
+		json_object_set_new(deps, "jansson", json_string(JANSSON_VERSION));
+		json_object_set_new(deps, "libnice", json_string(libnice_version_string));
+		json_object_set_new(deps, "libsrtp", json_string(srtp_get_version_string()));
+	#ifdef HAVE_TURNRESTAPI
+		curl_version_info_data *curl_version = curl_version_info(CURLVERSION_NOW);
+		if(curl_version && curl_version->version)
+			json_object_set_new(deps, "libcurl", json_string(curl_version->version));
+	#endif
+		json_object_set_new(deps, "crypto", json_string(janus_get_ssl_version()));
+		json_object_set_new(info, "dependencies", deps);
+	}
 	/* Available transports */
 	json_t *t_data = json_object();
 	if(transports && g_hash_table_size(transports) > 0) {
@@ -3290,7 +3322,7 @@ static gboolean janus_plugin_close_pc_internal(gpointer user_data) {
 	/* We actually enforce the close_pc here */
 	janus_plugin_session *plugin_session = (janus_plugin_session *) user_data;
 	janus_ice_handle *ice_handle = (janus_ice_handle *)plugin_session->gateway_handle;
-	if(!ice_handle) {
+	if(!ice_handle || !g_atomic_int_compare_and_exchange(&ice_handle->closepc, 1, 0)) {
 		janus_refcount_decrease(&plugin_session->ref);
 		return G_SOURCE_REMOVE;
 	}
@@ -3313,6 +3345,9 @@ static gboolean janus_plugin_close_pc_internal(gpointer user_data) {
 void janus_plugin_close_pc(janus_plugin_session *plugin_session) {
 	/* A plugin asked to get rid of a PeerConnection: enqueue it as a timed source */
 	if(!janus_plugin_session_is_alive(plugin_session))
+		return;
+	janus_ice_handle *ice_handle = (janus_ice_handle *)plugin_session->gateway_handle;
+	if(!ice_handle || !g_atomic_int_compare_and_exchange(&ice_handle->closepc, 0, 1))
 		return;
 	janus_refcount_increase(&plugin_session->ref);
 	GSource *timeout_source = g_timeout_source_new_seconds(0);
@@ -3677,6 +3712,9 @@ gint main(int argc, char *argv[])
 	if(args_info.token_auth_secret_given) {
 		janus_config_add(config, config_general, janus_config_item_create("token_auth_secret", args_info.token_auth_secret_arg));
 	}
+	if(args_info.no_webrtc_encryption_given) {
+		janus_config_add(config, config_general, janus_config_item_create("no_webrtc_encryption", "yes"));
+	}
 	if(args_info.cert_pem_given) {
 		janus_config_add(config, config_certs, janus_config_item_create("cert_pem", args_info.cert_pem_arg));
 	}
@@ -3764,6 +3802,13 @@ gint main(int argc, char *argv[])
 		lock_debug = janus_is_true(item->value);
 	if(lock_debug) {
 		JANUS_PRINT("Lock/mutex debugging is enabled\n");
+	}
+
+	/* First of all, let's check if we're disabling WebRTC encryption for debugging purposes */
+	item = janus_config_get(config, config_general, janus_config_type_item, "no_webrtc_encryption");
+	if(item && item->value && janus_is_true(item->value)) {
+		JANUS_LOG(LOG_WARN, "Disabling WebRTC encryption: *THIS IS ONLY ACCEPTABLE WHEN DEBUGGING!*\n");
+		webrtc_encryption = FALSE;
 	}
 
 	/* Any IP/interface to enforce/ignore? */
@@ -3912,6 +3957,11 @@ gint main(int argc, char *argv[])
 	} else {
 		janus_recorder_init(FALSE, NULL);
 	}
+
+	/* Check if we should hide dependencies in "info" requests */
+	item = janus_config_get(config, config_general, janus_config_type_item, "hide_dependencies");
+	if(item && item->value && janus_is_true(item->value))
+		hide_dependencies = TRUE;
 
 	/* Setup ICE stuff (e.g., checking if the provided STUN server is correct) */
 	char *stun_server = NULL, *turn_server = NULL;
