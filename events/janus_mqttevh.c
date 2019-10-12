@@ -273,6 +273,8 @@ static int janus_mqttevh_send_message(void *context, const char *topic, json_t *
 		JANUS_LOG(LOG_WARN, "Can't publish to MQTT topic: %s, return code: %d\n", ctx->publish.topic, rc);
 	}
 
+	free(payload);
+
 	JANUS_LOG(LOG_HUGE, "Done with message to JSON for %s\n", topic);
 
 	return 0;
@@ -698,7 +700,7 @@ static int janus_mqttevh_init(const char *config_path) {
 			ctx->will.qos = atoi(will_qos_item->value);
 		}
 
-		/* Using the topic for LWT as configured for publish and prefixed with JANUS_MQTTEVH_STATUS_TOPIC. */
+		/* Using the topic for LWT as configured for publish and suffixed with JANUS_MQTTEVH_STATUS_TOPIC. */
 		char will_topic_buf[512];
 		snprintf(will_topic_buf, sizeof(will_topic_buf), "%s/%s", ctx->publish.topic, JANUS_MQTTEVH_STATUS_TOPIC);
 		ctx->will.topic = g_strdup(will_topic_buf);
